@@ -1,0 +1,84 @@
+#
+# 文件路径：.github/workflows/Update.yml
+# 文件说明：固件更新检测
+#
+# Copyright (c) 2026 frostcypress
+#
+
+# 工作流Workflows名称
+name: Update
+
+on:
+  # 支持Actions页面手动触发
+  workflow_dispatch:  
+  # 定时自动检测
+  schedule:                 
+    - cron: '0 */4 */3 * *'
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: 拉取代码到虚拟运行环境
+      uses: actions/checkout@v6
+
+    - name: 加载全局变量
+      run: grep -v '^#' Part0_Global.env | grep -v '^$' >> $GITHUB_ENV   
+
+    - name: 获取OpenWrt源码哈希值
+      id: shash
+      run: bash scripts/hash.sh
+
+    - name: 获取编译最新哈希值
+      id: bhash
+      run: |
+        CACHE_KEY=$(gh api repos/${{ github.repository }}/actions/caches \
+          --paginate -q '.actions_caches[]
+          | select(.key | startswith("${{ env.SOURCE_NAME }}-sync-"))
+          | .key' | sort -r | head -n1 || echo "") 
+        if [[ -z "$CACHE_KEY" ]]; then
+          echo "buildHash=" >> $GITHUB_OUTPUT
+          echo "⚠️ 未找到任何缓存，开始首次编译..."
+        else
+          BUILD_HASH=$(echo $CACHE_KEY | awk -F '-' '{print $(NF-1)}')
+          echo "buildHash=$BUILD_HASH" >> $GITHUB_OUTPUT
+        fi    
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        
+    - name: 对比源码和编译哈希值
+      id: compare
+      run: |
+        NEW=${{ steps.shash.outputs.sourceHash }}
+        OLD=${{ steps.bhash.outputs.buildHash }}
+        [ -z "$OLD" ] && OLD="无记录"
+        [ -z "$NEW" ] && NEW="无记录"
+        echo "⚠️ 编译最新哈希值：$OLD"
+        echo "⚠️ 源码最新哈希值：$NEW"
+        if [ "$NEW" = "$OLD" ]; then
+          echo "need_build=no" >> $GITHUB_OUTPUT
+          echo "✅ 匹配成功，无需编译..."
+        else
+          echo "need_build=yes" >> $GITHUB_OUTPUT
+          echo "❌ 匹配失败，开始编译..."
+          echo "$NEW" > ./last_build_hash.txt
+        fi
+          
+    - name: 触发编译工作流
+      if: steps.compare.outputs.need_build == 'yes'
+      run: |
+        gh api --method POST \
+        repos/${{ github.repository }}/dispatches \
+        -f event_type='Update_Build'
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+
+    - name: 清理旧Workflows运行记录
+      if: always()
+      run: bash scripts/clean.sh
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_WORKFLOW: ${{ github.workflow }}
+        CLEAN_TYPE: workflow
+        KEEP_LATEST: 10
+        KEEP_DAYS: 90

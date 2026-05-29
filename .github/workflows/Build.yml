@@ -1,0 +1,254 @@
+#
+# 文件路径：.github/workflows/Build.yml
+# 文件说明：手动编译固件
+#
+# Copyright (c) 2026 frostcypress
+#
+
+# 工作流Workflows名称
+name: Build
+
+on:
+  # 支持API远程触发
+  repository_dispatch:
+    types: [Update_Build]
+  # 支持Actions页面手动触发
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    outputs:
+      devices: ${{ steps.scan.outputs.devices }}
+    steps:
+      - name: 拉取代码到虚拟运行环境
+        uses: actions/checkout@v6
+      
+      - name: 扫描CONFIGS设备
+        id: scan
+        run: |
+          [ -d configs ] || { echo "❌ 无configs目录" && exit 1; }
+          list=$(ls configs/*.config 2>/dev/null | xargs -r basename -s .config)
+          [ -z "$list" ] && { echo "❌ 没有找到.config文件，终止编译！" && exit 1; }
+          echo devices=$(echo "$list" | jq -R . | jq -cs .) >> $GITHUB_OUTPUT
+          echo "✅ 扫描到的设备：$list"
+
+  
+  build:
+    needs: scan
+    runs-on: ubuntu-22.04
+    strategy:
+        fail-fast: false
+        matrix:
+          device: ${{ fromJson(needs.scan.outputs.devices) }}
+    steps:
+    - name: 拉取代码到虚拟运行环境
+      uses: actions/checkout@v6
+
+    - name: 加载PART0_GLOBAL全局变量
+      run: grep -v '^#' Part0_Global.env | grep -v '^$' >> $GITHUB_ENV
+
+    - name: 初始化编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 清理系统冗余文件释放空间
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        # 清理本地docker镜像
+        sudo docker image prune --all --force
+        # 更新软件源
+        sudo -E apt-get -qq update
+        # 安装编译依赖
+        sudo -E apt-get -qq install \
+        ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+        bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+        g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+        libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+        libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+        ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+        python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+        upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+        # 卸载无用依赖
+        sudo -E apt-get -qq autoremove --purge
+        # 清理apt缓存
+        sudo -E apt-get -qq clean
+        # 设置系统时区
+        sudo timedatectl set-timezone "$TZ"
+        # 创建工作目录
+        sudo mkdir -p /workdir "${{ env.CACHE_SYNC }}"
+        # 赋予工作目录权限
+        sudo chown $USER:$GROUPS /workdir "${{ env.CACHE_SYNC }}"
+
+    - name: 获取OpenWrt源码哈希值
+      id: shash
+      if: env.USE_CCACHE == 'true'
+      run: bash scripts/hash.sh
+
+    - name: 恢复Cache缓存数据
+      if: env.USE_CCACHE == 'true'
+      uses: actions/cache@v5
+      with:
+        path: ${{ env.CACHE_SYNC }}
+        key: ${{ env.SOURCE_NAME }}-sync-${{ matrix.device }}-${{ steps.shash.outputs.sourceHash }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ env.SOURCE_NAME }}-sync-${{ matrix.device }}-${{ steps.shash.outputs.sourceHash }}-
+      
+    - name: 克隆OpenWrt源码
+      working-directory: /workdir
+      run: |
+        # 查看当前磁盘空间
+        df -hT $PWD
+        # 拉取指定仓库和分支的源码
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        # 创建软链接，方便后续调用
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: 同步Cache缓存数据
+      if: env.USE_CCACHE == 'true'
+      run: |
+        bash scripts/rsync.sh sync dl          "${{ env.CACHE_SYNC }}/dl"          /workdir/openwrt/dl
+        bash scripts/rsync.sh sync staging_dir "${{ env.CACHE_SYNC }}/staging_dir" /workdir/openwrt/staging_dir
+        bash scripts/rsync.sh sync ccache      "${{ env.CACHE_SYNC }}/ccache"      /workdir/openwrt/.ccache
+        
+    - name: 执行PART1_FEEDS配置文件
+      run: |
+        chmod +x $PART1_FEEDS
+        cd openwrt
+        $GITHUB_WORKSPACE/$PART1_FEEDS
+    
+    - name: 更新并安装插件源软件包
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+  
+    - name: 执行PART2_CUSTOM配置文件
+      run: |
+        [ -e files ] && mv files openwrt/files
+        # 加载Configs对应设备的编译配置
+        cp configs/${{ matrix.device }}.config openwrt/.config
+        chmod +x $PART2_CUSTOM
+        cd openwrt
+        make defconfig
+        $GITHUB_WORKSPACE/$PART2_CUSTOM
+
+    - name: 下载编译所需源码包
+      run: |
+        cd openwrt
+        make download -j8
+        # 列出和删除小于1024字节的无效文件
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name:  编译OpenWrt固件
+      id: compile
+      run: |
+        cd openwrt
+        # 清空命中信息
+        CCACHE_DIR=/workdir/openwrt/.ccache ccache -z
+        # 加速编译代码（通过哈希值判断是否启用）
+        if [[ -n "${{ steps.shash.outputs.sourceHash }}" && -d "$CACHE_SYNC/staging_dir" ]]; then
+          mkdir -p tools toolchain
+          printf "%%:\n\t@true\n" > tools/Makefile
+          printf "%%:\n\t@true\n" > toolchain/Makefile
+          echo "✅ 缓存加速中..."
+        fi
+        # 多线程编译，失败降级单线程重试，最后带日志排查
+        echo "⚠️ 开启$(nproc)线程编译"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        # 提取当前编译的设备型号
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        # 设备名写入环境变量
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        # 生成时间戳写入环境变量
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: 备份Cache缓存数据
+      if: env.USE_CCACHE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        bash scripts/rsync.sh backup dl          /workdir/openwrt/dl          ${{ env.CACHE_SYNC }}/dl
+        bash scripts/rsync.sh backup staging_dir /workdir/openwrt/staging_dir ${{ env.CACHE_SYNC }}/staging_dir
+        bash scripts/rsync.sh backup ccache      /workdir/openwrt/.ccache     ${{ env.CACHE_SYNC }}/ccache
+    
+    - name: 查看Cache缓存数据
+      if: env.USE_CCACHE == 'true'
+      run: |
+        echo
+        echo -e "⚠️ 缓存软件版本"
+        ccache --version | head -n1
+        echo -e "\n⚠️ 缓存命中统计"
+        CCACHE_DIR=/workdir/openwrt/.ccache ccache -s
+        echo -e "\n⚠️ 编译数据目录大小"
+        du -sh "${{ env.CACHE_SYNC }}"/*
+    
+    - name: 查看系统磁盘占用
+      if: steps.compile.outputs.status == 'success' && !cancelled() 
+      run: df -hT
+  
+    - name: 上传Bin目录到Actions页面
+      uses: actions/upload-artifact@v6
+      if: env.UPLOAD_BIN_DIR == 'true' && steps.compile.outputs.status == 'success' && !cancelled() 
+      with:
+        name: ${{ env.SOURCE_NAME }}_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+  
+    - name: 精简Bin目录，保留核心固件
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
+      run: bash scripts/organize.sh
+      env:
+        SOURCE_NAME: ${{ env.SOURCE_NAME }}
+        KEEP_EXTS: .img .img.gz
+  
+    - name: 上传核心固件到Actions页面
+      uses: actions/upload-artifact@v6
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ${{ env.SOURCE_NAME }}_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+  
+    - name: 发布核心固件到Releases页面
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success' && !cancelled()
+      run: bash scripts/release.sh
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        FIRMWARE: ${{ env.FIRMWARE }}
+        RELEASE_NOTES: ${{ env.RELEASE_NOTES }}
+        VERSION_PREFIX: v1.0
+
+  
+  clean:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: always()
+    steps:
+      - name: 拉取代码到虚拟运行环境
+        uses: actions/checkout@v6
+    
+      - name: 清理旧Releases和Tags
+        run: bash scripts/clean.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLEAN_TYPE: release
+          KEEP_LATEST: 10
+          KEEP_DAYS: 90
+  
+      - name: 清理旧Workflows运行记录
+        run: bash scripts/clean.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          CLEAN_TYPE: workflow
+          KEEP_LATEST: 5
+          KEEP_DAYS: 90
+  
+      - name: 清理旧Cache缓存记录
+        run: bash scripts/clean.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLEAN_TYPE: cache
+          KEEP_LATEST: 3
+          KEEP_DAYS: 5
