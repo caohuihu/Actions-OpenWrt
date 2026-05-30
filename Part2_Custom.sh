@@ -19,7 +19,7 @@ echo "CONFIG_CCACHE=y" >> .config
 echo "CONFIG_CCACHE_DIR=\"/workdir/openwrt/.ccache\"" >> .config
 
 # 修改登录IP
-NEW_IP="192.168.2.10"
+NEW_IP="192.168.88.1"
 # 修改登录密码
 NEW_PASSWORD="123456"
 # 执行IP、登录密码配置代码
