@@ -39,4 +39,5 @@ src-git telephony https://github.com/openwrt/telephony.git;openwrt-25.12
 src-git video https://github.com/openwrt/video.git;openwrt-25.12
 src-git bandix_plus_backend https://github.com/timsaya/openwrt-bandix-plus.git
 src-git luci_bandix_plus_frontend https://github.com/timsaya/luci-app-bandix-plus.git
+src-git luci_app_mosdns https://github.com/sbwml/luci-app-mosdns.git
 EOF
